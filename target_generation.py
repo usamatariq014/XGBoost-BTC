@@ -61,10 +61,18 @@ def triple_barrier_labeling(df: pd.DataFrame, horizon: int, sl_mult: float, tp_m
                 
     return labels
 
+# Replace the process_file function with this version:
 def process_file(input_path: Path, output_path: Path):
     logger.info(f"--- Processing Target Generation: {input_path} ---")
-    if not input_path.exists(): return
+    if not input_path.exists(): 
+        logger.error(f"Input file not found: {input_path}")
+        return
+    
     df = pd.read_csv(input_path)
+    
+    # CRITICAL: Convert Open time to datetime if needed
+    if not np.issubdtype(df['Open time'].dtype, np.datetime64):
+        df['Open time'] = pd.to_datetime(df['Open time'])
     
     targets = triple_barrier_labeling(df, HORIZON, ATR_MULTIPLIER_SL, ATR_MULTIPLIER_TP)
     df['target'] = targets
@@ -72,8 +80,13 @@ def process_file(input_path: Path, output_path: Path):
     wins = sum(targets)
     logger.info(f"Target Distribution: {wins} Wins out of {len(targets)} rows ({wins/len(targets):.2%})")
     
-    df.to_csv(output_path, index=False)
+    # Drop the last HORIZON rows (no future data to calculate targets)
+    df_final = df.iloc[:-HORIZON].copy()
+    logger.info(f"Dropped last {HORIZON} rows (no future data for target calculation)")
+    
+    df_final.to_csv(output_path, index=False)
     logger.info(f"Saved to: {output_path}")
+    logger.info(f"Final shape: {df_final.shape}")
 
 if __name__ == "__main__":
     process_file(TRAIN_FEATURES_PATH, TRAIN_FINAL_PATH)
