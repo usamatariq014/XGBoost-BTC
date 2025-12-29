@@ -1,5 +1,25 @@
-/models
-/venv
-/training
-/testing
-/raw_data
+# --- Project Specific Data/Outputs ---
+/models/
+/venv/
+/training/
+/testing/
+/raw_data/
+*.png
+*.log
+
+# --- Python Standard ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- IDEs ---
+.vscode/
+.idea/
+.DS_Store
+
+# --- OS specific ---
+Thumbs.db
+desktop.ini
