@@ -1,6 +1,6 @@
-# AlgoXG: Bitcoin Intraday Trading Bot
+# Bitcoin Intraday Trading Bot
 
-AlgoXG is a systematic hourly Bitcoin (BTC) trading system built using XGBoost. The project focuses on creating a robust machine learning pipeline that handles data preparation, feature engineering with zero temporal leakage, target generation using triple barrier labeling, and realistic backtesting with fees and slippage.
+This is a systematic hourly Bitcoin (BTC) trading system built using XGBoost. The project focuses on creating a robust machine learning pipeline that handles data preparation, feature engineering with zero temporal leakage, target generation using triple barrier labeling, and realistic backtesting with fees and slippage.
 
 The goal is to provide a framework for training a high confidence classifier that identifies profitable intraday trading opportunities while maintaining strict risk management.
 
