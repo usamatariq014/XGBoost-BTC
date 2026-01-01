@@ -7,6 +7,13 @@
 *.png
 *.log
 
+# --- Output/Temp Files ---
+*_output.txt
+*_output*.txt
+*_investigation.txt
+*_log.csv
+outputs/
+
 # --- Python Standard ---
 __pycache__/
 *.py[cod]

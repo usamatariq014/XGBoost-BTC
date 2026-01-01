@@ -6,14 +6,13 @@ import sys
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
-from sklearn.preprocessing import PolynomialFeatures
 
 # --- Configuration ---
 TEST_DATA_PATH = Path("testing/test_final.csv")
 MODEL_PATH = Path("models/xgb_model.pkl")
 
 # Strategy Settings
-THRESHOLD = 0.75       # Using the profitable threshold from analysis
+THRESHOLD = 0.55       # Balance between quality and quantity
 RISK_PER_TRADE = 0.02  # Risk 2% of account per trade
 STARTING_BALANCE = 10000  # More realistic starting amount
 TRADING_FEE = 0.00075  # 0.075% per trade (Binance spot fee)
@@ -24,7 +23,16 @@ MAX_LEVERAGE = 1.0     # 1x for spot trading (no leverage)
 MAX_DRAWDOWN = 0.25    # 25% max drawdown stop
 HORIZON = 24           # 24-hour trade window
 ATR_MULTIPLIER_SL = 1.0
-ATR_MULTIPLIER_TP = 2.0
+ATR_MULTIPLIER_TP = 1.5   # Reduced from 2.0 for higher win rate (1:1.5 R:R still profitable)
+
+# Trailing Stop Loss Settings
+TRAILING_ACTIVATION = 1.0  # Activate trailing at 1R profit (1 ATR)
+TRAILING_DISTANCE = 0.5    # Trail by 0.5 ATR behind price
+
+# Filters
+TREND_FILTER = True        # Only trade when price > EMA200
+VOLATILITY_FILTER = False  # Disabled - too restrictive
+MAX_ATR_PCT = 0.03         # Max ATR 3% for volatility filter (if enabled)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger(__name__)
@@ -39,78 +47,108 @@ class Backtester:
             'Ignore', 'target', 'Close time'
         ]
         
-        # Same polynomial features used in training
-        self.poly = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
         self.start_date = None  # Will be set during data loading
 
     def prepare_features(self, df):
-        """Prepare features EXACTLY as done during training"""
-        # Drop non-feature columns
+        """Prepare features EXACTLY as done during training (raw features, no polynomial expansion)"""
+        # Drop non-feature columns, return raw features
         features = df.drop(columns=[c for c in self.drop_cols if c in df.columns])
-        
-        # Get base feature names (before interactions)
-        base_feature_names = features.columns.tolist()
-        
-        # Apply polynomial features
-        X_poly = self.poly.fit_transform(features)
-        feature_names = self.poly.get_feature_names_out(base_feature_names)
-        
-        # Create DataFrame with proper feature names
-        features_df = pd.DataFrame(X_poly, columns=feature_names)
-        
-        return features_df
+        return features
 
     def calculate_trade_outcome(self, entry_row, future_data):
         """
-        Simulate a single trade using actual price data.
+        Simulate a single trade with TRAILING STOP LOSS.
         Returns: (pnl, exit_reason, hold_time)
+        
+        Features:
+        1. OHLC-based priority for same-candle TP/SL hits
+        2. Trailing stop activates at 1R profit
+        3. Trail distance is 0.5 ATR behind highest price
         """
         entry_price = entry_row['Close']
         atr_pct = entry_row['atr_pct']
+        atr_value = entry_price * atr_pct
         
-        # Calculate stop loss and take profit prices
-        sl_price = entry_price * (1 - (atr_pct * ATR_MULTIPLIER_SL))
-        tp_price = entry_price * (1 + (atr_pct * ATR_MULTIPLIER_TP))
-        
-        # Apply slippage to entry price (worse execution)
+        # Apply slippage to entry
         entry_price_with_slippage = entry_price * (1 + SLIPPAGE)
+        
+        # Calculate initial SL and TP from execution price
+        initial_sl = entry_price_with_slippage * (1 - (atr_pct * ATR_MULTIPLIER_SL))
+        tp_price = entry_price_with_slippage * (1 + (atr_pct * ATR_MULTIPLIER_TP))
+        
+        # Trailing stop state
+        current_sl = initial_sl
+        trailing_active = False
+        highest_price = entry_price_with_slippage
+        
+        # Activation price for trailing (1R profit)
+        trailing_activation_price = entry_price_with_slippage * (1 + (atr_pct * TRAILING_ACTIVATION))
+        trailing_distance = atr_pct * TRAILING_DISTANCE
         
         # Track trade outcome
         exit_price = None
         exit_reason = "HORIZON"
         hold_time = HORIZON
         
-        # Check each future candle for SL/TP hits
-        for i, row in future_data.iterrows():
+        # Check each future candle
+        for idx, (i, row) in enumerate(future_data.iterrows()):
+            candle_open = row['Open']
             candle_high = row['High']
             candle_low = row['Low']
+            candle_close = row['Close']
             
-            # Check if SL hit first (lowest priority)
-            if candle_low <= sl_price:
-                exit_price = max(sl_price, candle_low)  # Use worst price
-                exit_reason = "STOP_LOSS"
-                hold_time = i + 1
-                break
+            # Update highest price seen (for trailing)
+            if candle_high > highest_price:
+                highest_price = candle_high
                 
-            # Check if TP hit (highest priority)
-            if candle_high >= tp_price:
-                exit_price = min(tp_price, candle_high)  # Use best price
+                # If trailing is active, update SL
+                if trailing_active:
+                    new_trailing_sl = highest_price * (1 - trailing_distance)
+                    current_sl = max(current_sl, new_trailing_sl)
+            
+            # Check if trailing should activate (price reached 1R profit)
+            if not trailing_active and candle_high >= trailing_activation_price:
+                trailing_active = True
+                # Move SL to at least breakeven
+                breakeven = entry_price_with_slippage
+                current_sl = max(current_sl, breakeven)
+                # Start trailing from current highest
+                new_trailing_sl = highest_price * (1 - trailing_distance)
+                current_sl = max(current_sl, new_trailing_sl)
+            
+            # Check for exits
+            tp_hit = candle_high >= tp_price
+            sl_hit = candle_low <= current_sl
+            
+            if tp_hit and sl_hit:
+                # Both hit - use OHLC order
+                if candle_close >= candle_open:
+                    # Bullish: Low hit first (SL)
+                    exit_price = current_sl
+                    exit_reason = "TRAILING_SL" if trailing_active else "STOP_LOSS"
+                else:
+                    # Bearish: High hit first (TP)
+                    exit_price = tp_price
+                    exit_reason = "TAKE_PROFIT"
+                hold_time = idx + 1
+                break
+            elif tp_hit:
+                exit_price = tp_price
                 exit_reason = "TAKE_PROFIT"
-                hold_time = i + 1
+                hold_time = idx + 1
+                break
+            elif sl_hit:
+                exit_price = current_sl
+                exit_reason = "TRAILING_SL" if trailing_active else "STOP_LOSS"
+                hold_time = idx + 1
                 break
         
         # If no exit triggered, close at horizon
         if exit_price is None:
             exit_price = future_data.iloc[-1]['Close']
         
-        # Apply slippage to exit price
-        if exit_reason == "STOP_LOSS":
-            exit_price_with_slippage = exit_price * (1 - SLIPPAGE)  # Worse execution on stop
-        else:
-            exit_price_with_slippage = exit_price * (1 - SLIPPAGE)  # Better execution on profit
-        
-        # Calculate PnL (before fees)
-        pnl_pct = (exit_price_with_slippage - entry_price_with_slippage) / entry_price_with_slippage
+        # Calculate PnL
+        pnl_pct = (exit_price - entry_price_with_slippage) / entry_price_with_slippage
         
         return pnl_pct, exit_reason, hold_time
 
@@ -177,8 +215,8 @@ class Backtester:
             
             # Handle active position
             if current_position is not None:
-                # Get future price data for trade simulation
-                future_data = df.iloc[i+1:i+1+HORIZON][['High', 'Low', 'Close']]
+                # Get future price data for trade simulation (include Open for OHLC priority)
+                future_data = df.iloc[i+1:i+1+HORIZON][['Open', 'High', 'Low', 'Close']]
                 
                 # Calculate trade outcome
                 pnl_pct, exit_reason, hold_time = self.calculate_trade_outcome(
@@ -213,9 +251,21 @@ class Backtester:
             
             # Check for new signal (only if no active position)
             if current_position is None and probs[i] >= THRESHOLD:
+                atr_pct = current_row['atr_pct']
+                
+                # TREND FILTER: Only trade when price > EMA200 (with the trend)
+                if TREND_FILTER:
+                    dist_ema200 = current_row['dist_ema200']
+                    if dist_ema200 < 0:  # Price below EMA200
+                        continue  # Skip counter-trend signal
+                
+                # VOLATILITY FILTER: Skip high-volatility periods
+                if VOLATILITY_FILTER:
+                    if atr_pct > MAX_ATR_PCT:
+                        continue  # Skip volatile period
+                
                 # Calculate position size based on risk
                 risk_amount = balance * RISK_PER_TRADE
-                atr_pct = current_row['atr_pct']
                 
                 if atr_pct <= 0.0001:  # Avoid division by zero
                     continue
